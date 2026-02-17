@@ -1,0 +1,205 @@
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+from collections import defaultdict
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+ARTICLE_URL = "https://academic.oup.com/gpb/article/21/1/216/7274180"
+OUT_XLSX = Path("chdbase_Table_S2.xlsx")
+OUT_CSV = Path("chdbase_Table_S2.csv")
+OUT_MERGED = Path("combined_gene_pool.csv")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CHDbaseSeedMerger/1.0"
+}
+
+# -------------------------
+# 1) Your seed genes (edit freely)
+# -------------------------
+# We'll store as gene -> set(sources), then collapse to "source1;source2".
+seed_sources: dict[str, set[str]] = defaultdict(set)
+
+def add_seeds(genes: list[str], source: str) -> None:
+    for g in genes:
+        g2 = (g or "").strip().upper()
+        if g2:
+            seed_sources[g2].add(source)
+
+# A) TOF / conotruncal / CHD core seeds (starter set + commonly cited)
+add_seeds([
+    "NKX2-5","GATA4","GATA6","TBX1","TBX2","TBX3","TBX5","TBX20",
+    "NOTCH1","JAG1","DLL4","HEY2",
+    "ZFPM2","HAND1","HAND2","MEF2C","ISL1","PITX2",
+    "SMAD6","SMAD3","BMP2","BMP4",
+    "KDR","VEGFA","FGF8","FGF10","PDGFRA",
+    "MYH6","ACTC1","RYR2","ANKRD1",
+    "CHD7","SALL4","SOX17","MEIS1",
+    "ELN","CRELD1","NOTCH2","JAG2",
+], "TOF/CHD (seed)")
+
+# B) 22q11.2 microdeletion region genes (common/representative protein-coding genes)
+# (This is not necessarily exhaustive for the entire region; it’s a practical “seed set”.)
+add_seeds([
+    "TBX1","CRKL","DGCR6","DGCR8","HIRA","UFD1L","PRODH","COMT","SEPT5","SNAP29",
+    "RTN4R","LZTR1","SLC25A1","GNB1L","CDC45","PI4KA","RANBP1","TXNRD2","MRPL40",
+    "ZDHHC8","ARVCF","TANGO2","P2RX6","CLTCL1","MED15","SLC7A4","SERPIND1",
+    "THAP7","ZNF74","TRMT2A","SCARF2","BID","GP1BB","TUBA8","YPEL1","DGCR2",
+], "22q11.2 microdeletion (seed)")
+
+# -------------------------
+# 2) Helpers: fetch & download CHDbase supplement
+# -------------------------
+def find_table_s2_url(html: str) -> str:
+    """
+    Parse Oxford Academic article HTML and locate the href for 'Supplementary Table S2'.
+    Returns absolute URL.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # First pass: anchors whose visible text mentions Supplementary Table S2
+    anchors = soup.find_all("a", string=re.compile(r"Supplementary\s+Table\s+S2", re.I))
+
+    # Fallback: sometimes the text is nested, so check get_text()
+    if not anchors:
+        for a in soup.find_all("a"):
+            txt = (a.get_text(" ", strip=True) or "")
+            if re.search(r"Supplementary\s+Table\s+S2", txt, flags=re.I):
+                anchors.append(a)
+
+    if not anchors:
+        raise RuntimeError("Could not find 'Supplementary Table S2' link on the article page.")
+
+    href = anchors[0].get("href")
+    if not href:
+        raise RuntimeError("Found 'Supplementary Table S2' but link has no href.")
+
+    # Make absolute
+    if href.startswith("//"):
+        return "https:" + href
+    if href.startswith("http"):
+        return href
+    return "https://academic.oup.com" + href
+
+
+def download_file(url: str, out_path: Path) -> None:
+    with requests.get(url, headers=HEADERS, stream=True, timeout=180) as r:
+        r.raise_for_status()
+        out_path.write_bytes(r.content)
+
+# -------------------------
+# 3) Merge CHDbase + seeds
+# -------------------------
+def normalize_gene_col(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """
+    Find a likely gene symbol column and normalize it to uppercase stripped.
+    Returns (df, gene_col_name).
+    """
+    # Common possibilities
+    candidates = ["Gene", "GENE", "gene", "Symbol", "SYMBOL", "HUGO", "HGNC", "Gene symbol", "GeneSymbol"]
+    for c in candidates:
+        if c in df.columns:
+            gene_col = c
+            break
+    else:
+        # Heuristic: first column that looks like it contains gene symbols
+        gene_col = df.columns[0]
+
+    df[gene_col] = df[gene_col].astype(str).str.strip().str.upper()
+    return df, gene_col
+
+
+def add_seed_annotations(df: pd.DataFrame, gene_col: str) -> pd.DataFrame:
+    """
+    Adds:
+      - is_seed_gene (True/False)
+      - seed_source (semicolon-separated sources, blank if not seed)
+    """
+    def is_seed(g: str) -> bool:
+        return g in seed_sources
+
+    def sources(g: str) -> str:
+        if g not in seed_sources:
+            return ""
+        return ";".join(sorted(seed_sources[g]))
+
+    df["is_seed_gene"] = df[gene_col].map(is_seed)
+    df["seed_source"] = df[gene_col].map(sources)
+    return df
+
+
+def append_seeds_not_in_chdbase(df: pd.DataFrame, gene_col: str) -> pd.DataFrame:
+    """
+    Ensure ALL seeds appear in final output even if they are not present in CHDbase.
+    Adds rows with only gene + seed annotations (other cols empty).
+    """
+    present = set(df[gene_col].dropna().astype(str).str.upper())
+    missing = sorted([g for g in seed_sources.keys() if g not in present])
+
+    if not missing:
+        return df
+
+    # Create blank rows with all columns
+    extra = pd.DataFrame(columns=df.columns)
+    extra[gene_col] = missing
+    extra = add_seed_annotations(extra, gene_col)
+
+    # For missing rows, keep is_seed_gene=True and seed_source filled; other cols remain NaN
+    merged = pd.concat([df, extra], ignore_index=True)
+    return merged
+
+
+def main() -> None:
+    print(f"Fetching article page:\n  {ARTICLE_URL}")
+    r = requests.get(ARTICLE_URL, headers=HEADERS, timeout=180)
+    r.raise_for_status()
+
+    table_s2_url = find_table_s2_url(r.text)
+    print(f"Found Supplementary Table S2 URL:\n  {table_s2_url}")
+
+    print(f"Downloading XLSX to: {OUT_XLSX.resolve()}")
+    download_file(table_s2_url, OUT_XLSX)
+
+    print("Reading XLSX...")
+    xls = pd.ExcelFile(OUT_XLSX)
+    sheet_name = xls.sheet_names[0]
+    df = pd.read_excel(OUT_XLSX, sheet_name=sheet_name)
+
+    # Save raw CSV
+    df.to_csv(OUT_CSV, index=False)
+    print(f"✅ Saved raw CHDbase supplement CSV: {OUT_CSV.resolve()} (sheet: {sheet_name}, rows: {len(df):,})")
+
+    # Normalize gene column, annotate seeds, append missing seeds
+    df, gene_col = normalize_gene_col(df)
+    df = add_seed_annotations(df, gene_col)
+    df = append_seeds_not_in_chdbase(df, gene_col)
+
+    # Reorder columns to put key annotations up front
+    cols = list(df.columns)
+    # Move gene_col, is_seed_gene, seed_source to front
+    front = [gene_col, "is_seed_gene", "seed_source"]
+    rest = [c for c in cols if c not in front]
+    df = df[front + rest]
+
+    # Deduplicate by gene symbol (keep the first CHDbase row if duplicates exist)
+    df = df.drop_duplicates(subset=[gene_col], keep="first").reset_index(drop=True)
+
+    df.to_csv(OUT_MERGED, index=False)
+    print(f"✅ Saved merged gene pool CSV: {OUT_MERGED.resolve()} (rows: {len(df):,})")
+    print("\nDone. Columns added: is_seed_gene, seed_source")
+    print("Tip: You can now filter is_seed_gene==True to get your curated seed set.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\n❌ Error: {e}", file=sys.stderr)
+        print("\nTroubleshooting:", file=sys.stderr)
+        print("  - Install deps: python -m pip install requests beautifulsoup4 pandas openpyxl lxml", file=sys.stderr)
+        print("  - If your network blocks Oxford Academic, try another network/VPN.", file=sys.stderr)
+        sys.exit(1)
