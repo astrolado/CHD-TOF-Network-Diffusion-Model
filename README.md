@@ -7,9 +7,6 @@ The goal of this project is to demonstrate how artificial intelligence can be ap
 
 This is a computational research project and does not involve clinical or patient data.*
 
-
-# AI Model Approach
-
 **1) Bioinformatics**
 
 Each gene is converted into structured features such as:
